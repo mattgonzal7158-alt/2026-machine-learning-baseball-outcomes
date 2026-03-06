@@ -1,0 +1,1 @@
+{"features": ["pitcher", "batter", "pitch_type", "balls", "strikes", "outs_when_up", "inning", "stand", "p_throws", "release_speed", "release_spin_rate", "pfx_x", "pfx_z", "zone", "runner_1b", "runner_2b", "runner_3b", "run_diff"], "cat_cols": ["pitcher", "batter", "pitch_type", "stand", "p_throws", "zone"]}
