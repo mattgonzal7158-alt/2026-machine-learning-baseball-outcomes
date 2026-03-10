@@ -1,0 +1,53 @@
+{
+  "feature_cols": [
+    "pitcher",
+    "batter",
+    "balls",
+    "strikes",
+    "outs_when_up",
+    "inning",
+    "inning_topbot",
+    "stand",
+    "p_throws",
+    "on_1b",
+    "on_2b",
+    "on_3b",
+    "bat_score",
+    "fld_score",
+    "home_team",
+    "away_team",
+    "release_speed",
+    "release_spin_rate",
+    "zone",
+    "pfx_x",
+    "pfx_z"
+  ],
+  "cat_cols": [
+    "pitcher",
+    "batter",
+    "inning_topbot",
+    "stand",
+    "p_throws",
+    "home_team",
+    "away_team"
+  ],
+  "target_col": "pa_outcome",
+  "train_years": [
+    2021,
+    2022,
+    2023,
+    2024
+  ],
+  "test_years": [
+    2025
+  ],
+  "classes": [
+    "double",
+    "home_run",
+    "out",
+    "single",
+    "strikeout",
+    "triple",
+    "walk"
+  ]
+}

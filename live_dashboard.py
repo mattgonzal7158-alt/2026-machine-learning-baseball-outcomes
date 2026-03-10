@@ -1,6 +1,9 @@
 import time
 import json
+import importlib.util
+from pathlib import Path
 from datetime import datetime
+
 import requests
 import numpy as np
 import pandas as pd
@@ -9,13 +12,20 @@ import streamlit.components.v1 as components
 from catboost import CatBoostClassifier
 
 # ============================================================
-# Live MLB Matchup Odds Dashboard (Scorebug includes matchup)
-# Changes requested:
-# - Add pitcher + hitter names INSIDE the scorebug (center area)
-# - Force all scorebug text to white for readability
-# - Remove the separate MATCHUP block below the scorebug
-# - Auto-refresh the daily MLB slate when the date changes in ET
-# - Refresh schedule periodically so new statuses/games appear
+# Live MLB Matchup Odds Dashboard
+# Includes:
+# - Scorebug with matchup inside
+# - Live PA outcome / ball type snapshot
+# - Compact game simulator box on left:
+#   - Pregame win %
+#   - Pregame projected score
+#   - Live win %
+#   - Live projected final score
+#
+# IMPORTANT:
+# This expects:
+#   final_game_simulator.py
+# in the same folder as this file.
 # ============================================================
 
 st.set_page_config(page_title="Live MLB Matchup Odds", layout="wide")
@@ -68,6 +78,60 @@ st.markdown(
     }
     .label {min-width:120px; font-weight:700;}
     .pct {min-width:78px; text-align:right; font-weight:800;}
+
+    .sim-wrap{
+        margin-top:10px;
+        padding:12px;
+        border-radius:16px;
+        border:1px solid rgba(255,255,255,0.10);
+        background:rgba(20,22,30,0.55);
+    }
+    .sim-title{
+        font-size:13px;
+        font-weight:800;
+        color:rgba(255,255,255,0.96);
+        margin-bottom:8px;
+    }
+    .sim-sub{
+        font-size:11px;
+        color:rgba(255,255,255,0.70);
+        margin-bottom:10px;
+    }
+    .sim-grid{
+        display:grid;
+        grid-template-columns:1fr 1fr;
+        gap:10px;
+    }
+    .sim-card{
+        border-radius:14px;
+        padding:10px 11px;
+        border:1px solid rgba(255,255,255,0.08);
+        background:rgba(0,0,0,0.14);
+    }
+    .sim-label{
+        font-size:11px;
+        color:rgba(255,255,255,0.65);
+        margin-bottom:6px;
+        text-transform:uppercase;
+        letter-spacing:0.2px;
+    }
+    .sim-value{
+        font-size:18px;
+        font-weight:900;
+        color:rgba(255,255,255,0.97);
+        line-height:1.1;
+    }
+    .sim-value-sm{
+        font-size:14px;
+        font-weight:800;
+        color:rgba(255,255,255,0.97);
+        line-height:1.2;
+    }
+    .sim-foot{
+        margin-top:8px;
+        font-size:11px;
+        color:rgba(255,255,255,0.62);
+    }
     </style>
     """,
     unsafe_allow_html=True
@@ -77,7 +141,7 @@ st.title("⚾ Live MLB Matchup Odds (Your Model) — Upgraded")
 
 
 # ----------------------------
-# Config (models in /models)
+# Config
 # ----------------------------
 MODEL_PA_PATH = "models/model_pa.cbm"
 MODEL_BT_PATH = "models/model_balltype.cbm"
@@ -87,8 +151,8 @@ META_PATH = "models/model_meta.json"
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
 LIVE_URL_TMPL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
 
-# how often to refresh the day's schedule list even if the date has not changed
 SCHEDULE_REFRESH_SECONDS = 600
+GAME_SIM_MODULE_PATH = "final_game_simulator.py"
 
 
 # ----------------------------
@@ -135,6 +199,12 @@ def safe_get(dct, keys, default=None):
         cur = cur[k]
     return cur
 
+def safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
 def current_base_state(offense_obj):
     r1 = 1 if offense_obj.get("first") is not None else 0
     r2 = 1 if offense_obj.get("second") is not None else 0
@@ -180,7 +250,7 @@ def status_priority(status: str) -> int:
     s = str(status).lower()
     if any(x in s for x in ["in progress", "manager challenge", "review", "delayed", "suspended"]):
         return 0
-    if any(x in s for x in ["pre-game", "scheduled", "warmup", "warmup ", "pregame"]):
+    if any(x in s for x in ["pre-game", "scheduled", "warmup", "pregame"]):
         return 1
     if any(x in s for x in ["final", "game over", "completed"]):
         return 3
@@ -475,6 +545,208 @@ def render_top_prob_rows(title, probs_dict, top_n=5):
 
 
 # ----------------------------
+# Final game simulator bridge
+# ----------------------------
+@st.cache_resource
+def load_game_simulator_module():
+    path = Path(GAME_SIM_MODULE_PATH)
+    if not path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location("final_game_simulator_module", str(path))
+    if spec is None or spec.loader is None:
+        return None
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def compute_live_win_pcts_from_results_df(results_df):
+    if results_df is None or len(results_df) == 0:
+        return None, None
+
+    away_win = float((results_df["away_runs"] > results_df["home_runs"]).mean() * 100.0)
+    home_win = float((results_df["home_runs"] > results_df["away_runs"]).mean() * 100.0)
+
+    tie_pct = float((results_df["away_runs"] == results_df["home_runs"]).mean() * 100.0)
+    if tie_pct > 0:
+        away_win += tie_pct / 2.0
+        home_win += tie_pct / 2.0
+
+    return away_win, home_win
+
+@st.cache_data(ttl=60)
+def get_game_simulator_panel_data(game_pk: int, n_sims: int = 150):
+    mod = load_game_simulator_module()
+    if mod is None:
+        return {
+            "loaded": False,
+            "error": "final_game_simulator.py not found",
+            "pregame": None,
+            "live": None
+        }
+
+    if not hasattr(mod, "run_pregame_projection") or not hasattr(mod, "run_live_projection"):
+        return {
+            "loaded": False,
+            "error": "run_pregame_projection / run_live_projection not found in final_game_simulator.py",
+            "pregame": None,
+            "live": None
+        }
+
+    out = {
+        "loaded": True,
+        "error": None,
+        "pregame": None,
+        "live": None
+    }
+
+    try:
+        pre = mod.run_pregame_projection(game_pk, n_sims=n_sims)
+        pre_result = pre.get("result", {}) if isinstance(pre, dict) else {}
+        pre_snap = pre.get("snapshot", {}) if isinstance(pre, dict) else {}
+
+        away_wp = safe_float(pre_result.get("away_win_pct"))
+        home_wp = safe_float(pre_result.get("home_win_pct"))
+
+        out["pregame"] = {
+            "away_abbr": pre_snap.get("away_abbr"),
+            "home_abbr": pre_snap.get("home_abbr"),
+            "away_score": safe_float(pre_result.get("away_avg_runs")),
+            "home_score": safe_float(pre_result.get("home_avg_runs")),
+            "away_win_pct": away_wp * 100.0 if away_wp is not None and away_wp <= 1.0 else away_wp,
+            "home_win_pct": home_wp * 100.0 if home_wp is not None and home_wp <= 1.0 else home_wp,
+        }
+    except Exception as e:
+        out["pregame"] = {"error": str(e)}
+
+    try:
+        live_proj = mod.run_live_projection(game_pk, n_sims=n_sims)
+        live_result = live_proj.get("result", {}) if isinstance(live_proj, dict) else {}
+        live_snap = live_proj.get("snapshot", {}) if isinstance(live_proj, dict) else {}
+
+        results_df = live_result.get("results_df")
+        away_live_win, home_live_win = compute_live_win_pcts_from_results_df(results_df)
+
+        out["live"] = {
+            "away_abbr": live_snap.get("away_abbr"),
+            "home_abbr": live_snap.get("home_abbr"),
+            "away_score": safe_float(live_result.get("away_avg_runs")),
+            "home_score": safe_float(live_result.get("home_avg_runs")),
+            "away_win_pct": away_live_win,
+            "home_win_pct": home_live_win,
+            "current_away_score": live_snap.get("away_score"),
+            "current_home_score": live_snap.get("home_score"),
+        }
+    except Exception as e:
+        out["live"] = {"error": str(e)}
+
+    return out
+
+def fmt_sim_pct(x):
+    if x is None:
+        return "—"
+    return f"{float(x):.1f}%"
+
+def fmt_sim_score(a, h):
+    if a is None or h is None:
+        return "—"
+    return f"{float(a):.1f} - {float(h):.1f}"
+
+def sim_leader_text(away_label, home_label, away_pct, home_pct):
+    if away_pct is None or home_pct is None:
+        return "—"
+    if away_pct >= home_pct:
+        return f"{away_label} favored"
+    return f"{home_label} favored"
+
+def render_simulator_box(sim_data, away_team, home_team):
+    if not sim_data.get("loaded", False):
+        st.markdown(
+            f"""
+            <div class="sim-wrap">
+              <div class="sim-title">📊 Game Simulator</div>
+              <div class="sim-sub">{away_team} @ {home_team}</div>
+              <div class="sim-foot">{sim_data.get("error", "Simulator not loaded")}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        return
+
+    pre = sim_data.get("pregame", {}) or {}
+    livep = sim_data.get("live", {}) or {}
+
+    pre_away_abbr = pre.get("away_abbr") or "AWAY"
+    pre_home_abbr = pre.get("home_abbr") or "HOME"
+    live_away_abbr = livep.get("away_abbr") or "AWAY"
+    live_home_abbr = livep.get("home_abbr") or "HOME"
+
+    pre_best_pct = None
+    if pre.get("away_win_pct") is not None and pre.get("home_win_pct") is not None:
+        pre_best_pct = max(pre["away_win_pct"], pre["home_win_pct"])
+
+    live_best_pct = None
+    if livep.get("away_win_pct") is not None and livep.get("home_win_pct") is not None:
+        live_best_pct = max(livep["away_win_pct"], livep["home_win_pct"])
+
+    pre_leader = sim_leader_text(
+        pre_away_abbr,
+        pre_home_abbr,
+        pre.get("away_win_pct"),
+        pre.get("home_win_pct")
+    )
+
+    live_leader = sim_leader_text(
+        live_away_abbr,
+        live_home_abbr,
+        livep.get("away_win_pct"),
+        livep.get("home_win_pct")
+    )
+
+    pre_score = fmt_sim_score(pre.get("away_score"), pre.get("home_score"))
+    live_score = fmt_sim_score(livep.get("away_score"), livep.get("home_score"))
+
+    pre_pct = fmt_sim_pct(pre_best_pct)
+    live_pct = fmt_sim_pct(live_best_pct)
+
+    html = f"""
+    <div class="sim-wrap">
+      <div class="sim-title">📊 Game Simulator</div>
+      <div class="sim-sub">{away_team} @ {home_team}</div>
+
+      <div class="sim-grid">
+        <div class="sim-card">
+          <div class="sim-label">Pregame Win%</div>
+          <div class="sim-value">{pre_pct}</div>
+          <div class="sim-foot">{pre_leader}</div>
+        </div>
+
+        <div class="sim-card">
+          <div class="sim-label">Pregame Score</div>
+          <div class="sim-value-sm">{pre_score}</div>
+          <div class="sim-foot">{pre_away_abbr} - {pre_home_abbr}</div>
+        </div>
+
+        <div class="sim-card">
+          <div class="sim-label">Live Win%</div>
+          <div class="sim-value">{live_pct}</div>
+          <div class="sim-foot">{live_leader}</div>
+        </div>
+
+        <div class="sim-card">
+          <div class="sim-label">Live Final Score</div>
+          <div class="sim-value-sm">{live_score}</div>
+          <div class="sim-foot">updates during game</div>
+        </div>
+      </div>
+    </div>
+    """
+
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ----------------------------
 # Model simulation (pitch-blend)
 # ----------------------------
 def build_situation_samples(
@@ -704,7 +976,9 @@ def extract_state(live_json):
         "strikes": strikes,
         "outs": outs,
         "inning": inning,
-        "r1": r1, "r2": r2, "r3": r3,
+        "r1": r1,
+        "r2": r2,
+        "r3": r3,
         "away_runs": away_runs,
         "home_runs": home_runs,
         "is_top": is_top
@@ -759,6 +1033,22 @@ with left:
         f"last schedule refresh: {schedule_loaded_at} · "
         f"auto schedule refresh: every {SCHEDULE_REFRESH_SECONDS // 60} min or when ET date changes"
     )
+
+    st.divider()
+
+    sim_n_sims = st.slider(
+        "Game simulator sims",
+        min_value=50,
+        max_value=500,
+        value=150,
+        step=25
+    )
+
+    sim_data = get_game_simulator_panel_data(
+        game_pk=gamePk,
+        n_sims=int(sim_n_sims)
+    )
+    render_simulator_box(sim_data, away_team, home_team)
 
 with right:
     try:
@@ -869,15 +1159,22 @@ with right:
                 with colA:
                     render_top_prob_rows("PA Outcome (Top)", out_probs_pct, top_n=5)
                     with st.expander("Full PA outcome table"):
-                        out_df = pd.DataFrame({"Outcome": list(out_probs_pct.keys()), "Percent": list(out_probs_pct.values())})
+                        out_df = pd.DataFrame({
+                            "Outcome": list(out_probs_pct.keys()),
+                            "Percent": list(out_probs_pct.values())
+                        })
                         out_df = out_df.sort_values("Percent", ascending=False).reset_index(drop=True)
                         st.dataframe(out_df, use_container_width=True, height=260)
+
                 with colB:
                     render_top_prob_rows("Ball Type (Top)", bt_probs_pct, top_n=5)
                     with st.expander("Pitch mix breakdown (this situation)"):
                         st.dataframe(mix_table, use_container_width=True, height=220)
                     with st.expander("Full ball type table"):
-                        bt_df = pd.DataFrame({"BallType": list(bt_probs_pct.keys()), "Percent": list(bt_probs_pct.values())})
+                        bt_df = pd.DataFrame({
+                            "BallType": list(bt_probs_pct.keys()),
+                            "Percent": list(bt_probs_pct.values())
+                        })
                         bt_df = bt_df.sort_values("Percent", ascending=False).reset_index(drop=True)
                         st.dataframe(bt_df, use_container_width=True, height=220)
 
@@ -889,4 +1186,4 @@ if auto and not manual:
     st.rerun()
 
 # Run:
-#   python -m streamlit run live_dashboard.py
+# python -m streamlit run live_dashboard.py
